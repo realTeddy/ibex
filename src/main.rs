@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use eframe::egui::text::LayoutJob;
 use mongodb::bson::{Bson, Document};
 use mongodb::Client;
 use mongodb::options::ClientOptions;
@@ -10,23 +11,19 @@ use tokio::runtime::Runtime;
 
 // ─── Async MongoDB backend ───────────────────────────────────────────────────
 
-/// Holds the active MongoDB connection state.
 struct MongoConnection {
     client: Client,
     current_db: String,
 }
 
-// Safety: MongoConnection only contains Client (which is Send+Sync) and String.
 unsafe impl Send for MongoConnection {}
 
-/// Result of a query execution.
 struct QueryResult {
     output: String,
     elapsed: Duration,
     _is_error: bool,
 }
 
-/// Parsed mongo-shell-style operations.
 enum MongoOp {
     UseDb(String),
     Find {
@@ -88,7 +85,6 @@ fn parse_script(script: &str) -> Result<Vec<MongoOp>, String> {
     Ok(ops)
 }
 
-/// Split on `;` or newlines, but only at depth 0 (outside braces/brackets/parens/strings).
 fn split_statements(script: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut current = String::new();
@@ -147,7 +143,7 @@ fn split_statements(script: &str) -> Vec<String> {
 }
 
 fn parse_db_command(stmt: &str) -> Result<MongoOp, String> {
-    let after_db = &stmt[3..]; // skip "db."
+    let after_db = &stmt[3..];
     let dot_pos = after_db
         .find('.')
         .ok_or("Expected db.<collection>.<method>(...)")?;
@@ -650,26 +646,261 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
     results
 }
 
-/// Pretty-print BSON documents as JSON.
+/// Pretty-print BSON documents as JSON -- single-pass, no intermediate String round-trip.
 fn format_documents(docs: &[Document]) -> String {
     if docs.is_empty() {
         return "(no results)".to_string();
     }
-    docs.iter()
-        .map(|doc| {
-            // Convert Document to serde_json::Value via the BSON serializer
-            let json_val: JsonValue = mongodb::bson::to_bson(doc)
-                .ok()
-                .and_then(|b| {
-                    // Convert Bson → serde_json::Value by serializing through JSON string
-                    let s = serde_json::to_string(&b).ok()?;
-                    serde_json::from_str(&s).ok()
-                })
-                .unwrap_or_else(|| JsonValue::String(format!("{doc:?}")));
-            serde_json::to_string_pretty(&json_val).unwrap_or_else(|_| format!("{doc:?}"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n---\n")
+    let mut out = String::with_capacity(docs.len() * 256);
+    for (i, doc) in docs.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n---\n");
+        }
+        // Bson implements Serialize; go directly Bson → serde_json::Value (no String round-trip)
+        let json_val: JsonValue = serde_json::to_value(Bson::Document(doc.clone()))
+            .unwrap_or_else(|_| JsonValue::String(format!("{doc:?}")));
+        // Write pretty JSON directly into our output buffer
+        let pretty =
+            serde_json::to_string_pretty(&json_val).unwrap_or_else(|_| format!("{doc:?}"));
+        out.push_str(&pretty);
+    }
+    out
+}
+
+// ─── Syntax highlighting ─────────────────────────────────────────────────────
+
+// Theme colors (dark mode)
+const COL_KEYWORD: egui::Color32 = egui::Color32::from_rgb(198, 120, 221); // purple
+const COL_METHOD: egui::Color32 = egui::Color32::from_rgb(97, 175, 239); // blue
+const COL_STRING: egui::Color32 = egui::Color32::from_rgb(152, 195, 121); // green
+const COL_NUMBER: egui::Color32 = egui::Color32::from_rgb(209, 154, 102); // orange
+const COL_BRACE: egui::Color32 = egui::Color32::from_rgb(224, 108, 117); // red
+const COL_BOOL: egui::Color32 = egui::Color32::from_rgb(209, 154, 102); // orange
+const COL_NULL: egui::Color32 = egui::Color32::from_rgb(224, 108, 117); // red
+const COL_KEY: egui::Color32 = egui::Color32::from_rgb(229, 192, 123); // yellow
+const COL_SEPARATOR: egui::Color32 = egui::Color32::from_rgb(92, 99, 112); // gray
+const COL_DEFAULT: egui::Color32 = egui::Color32::from_rgb(171, 178, 191); // light gray
+const COL_DB: egui::Color32 = egui::Color32::from_rgb(86, 182, 194); // cyan
+
+const MONGO_KEYWORDS: &[&str] = &[
+    "use",
+    "show",
+    "dbs",
+    "databases",
+    "collections",
+    "tables",
+];
+const MONGO_METHODS: &[&str] = &[
+    "find",
+    "countDocuments",
+    "count",
+    "insertOne",
+    "deleteOne",
+    "deleteMany",
+    "aggregate",
+    "updateOne",
+    "updateMany",
+];
+
+/// Syntax-highlight a mongo shell script for the editor.
+fn highlight_script(text: &str, font_id: egui::FontId) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let ch = chars[i];
+
+        // Strings
+        if ch == '"' || ch == '\'' {
+            let start = i;
+            let quote = ch;
+            i += 1;
+            while i < len && chars[i] != quote {
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            append_colored(&mut job, &s, COL_STRING, font_id.clone());
+            continue;
+        }
+
+        // "db" prefix
+        if ch == 'd' && i + 1 < len && chars[i + 1] == 'b' && (i + 2 >= len || chars[i + 2] == '.') {
+            append_colored(&mut job, "db", COL_DB, font_id.clone());
+            i += 2;
+            continue;
+        }
+
+        // Words (keywords, methods, identifiers)
+        if ch.is_alphabetic() || ch == '_' || ch == '$' {
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if MONGO_KEYWORDS.contains(&word.as_str()) {
+                append_colored(&mut job, &word, COL_KEYWORD, font_id.clone());
+            } else if MONGO_METHODS.contains(&word.as_str()) {
+                append_colored(&mut job, &word, COL_METHOD, font_id.clone());
+            } else if word == "true" || word == "false" {
+                append_colored(&mut job, &word, COL_BOOL, font_id.clone());
+            } else if word == "null" {
+                append_colored(&mut job, &word, COL_NULL, font_id.clone());
+            } else {
+                append_colored(&mut job, &word, COL_DEFAULT, font_id.clone());
+            }
+            continue;
+        }
+
+        // Numbers
+        if ch.is_ascii_digit() || (ch == '-' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
+            let start = i;
+            if ch == '-' {
+                i += 1;
+            }
+            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let num: String = chars[start..i].iter().collect();
+            append_colored(&mut job, &num, COL_NUMBER, font_id.clone());
+            continue;
+        }
+
+        // Braces/brackets/parens
+        if matches!(ch, '{' | '}' | '[' | ']' | '(' | ')') {
+            append_colored(&mut job, &ch.to_string(), COL_BRACE, font_id.clone());
+            i += 1;
+            continue;
+        }
+
+        // Everything else (dots, colons, semicolons, whitespace)
+        append_colored(&mut job, &ch.to_string(), COL_DEFAULT, font_id.clone());
+        i += 1;
+    }
+
+    job
+}
+
+/// Syntax-highlight JSON result text.
+fn highlight_json(text: &str, font_id: egui::FontId) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let ch = chars[i];
+
+        // Separator lines "---"
+        if ch == '-' && i + 2 < len && chars[i + 1] == '-' && chars[i + 2] == '-' {
+            let start = i;
+            while i < len && chars[i] == '-' {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            append_colored(&mut job, &s, COL_SEPARATOR, font_id.clone());
+            continue;
+        }
+
+        // Strings -- detect if this is a JSON key (followed by ':')
+        if ch == '"' {
+            let start = i;
+            i += 1;
+            while i < len && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+
+            // Look ahead for ':'
+            let mut j = i;
+            while j < len && chars[j].is_whitespace() && chars[j] != '\n' {
+                j += 1;
+            }
+            if j < len && chars[j] == ':' {
+                append_colored(&mut job, &s, COL_KEY, font_id.clone());
+            } else {
+                append_colored(&mut job, &s, COL_STRING, font_id.clone());
+            }
+            continue;
+        }
+
+        // Words: true, false, null
+        if ch.is_alphabetic() {
+            let start = i;
+            while i < len && chars[i].is_alphanumeric() {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            match word.as_str() {
+                "true" | "false" => {
+                    append_colored(&mut job, &word, COL_BOOL, font_id.clone());
+                }
+                "null" => {
+                    append_colored(&mut job, &word, COL_NULL, font_id.clone());
+                }
+                _ => {
+                    append_colored(&mut job, &word, COL_DEFAULT, font_id.clone());
+                }
+            }
+            continue;
+        }
+
+        // Numbers
+        if ch.is_ascii_digit() || (ch == '-' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
+            let start = i;
+            if ch == '-' {
+                i += 1;
+            }
+            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == 'e' || chars[i] == 'E' || chars[i] == '+' || chars[i] == '-') {
+                // Avoid consuming a '-' that starts a new negative number after 'e'
+                if (chars[i] == '-' || chars[i] == '+') && i > start && chars[i - 1] != 'e' && chars[i - 1] != 'E' {
+                    break;
+                }
+                i += 1;
+            }
+            let num: String = chars[start..i].iter().collect();
+            append_colored(&mut job, &num, COL_NUMBER, font_id.clone());
+            continue;
+        }
+
+        // Braces
+        if matches!(ch, '{' | '}' | '[' | ']') {
+            append_colored(&mut job, &ch.to_string(), COL_BRACE, font_id.clone());
+            i += 1;
+            continue;
+        }
+
+        // Everything else
+        append_colored(&mut job, &ch.to_string(), COL_DEFAULT, font_id.clone());
+        i += 1;
+    }
+
+    job
+}
+
+fn append_colored(job: &mut LayoutJob, text: &str, color: egui::Color32, font_id: egui::FontId) {
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        },
+    );
 }
 
 // ─── GUI Application ─────────────────────────────────────────────────────────
@@ -679,6 +910,8 @@ struct SharedState {
     is_running: bool,
     status_message: String,
     connected: bool,
+    /// Monotonic generation counter -- bumped every time result_text or status changes.
+    generation: u64,
 }
 
 struct IbexApp {
@@ -687,15 +920,22 @@ struct IbexApp {
     shared: Arc<Mutex<SharedState>>,
     connection: Arc<tokio::sync::Mutex<Option<MongoConnection>>>,
     rt: Arc<Runtime>,
-    // Cached copies read from shared each frame
+    // Cached copies -- only updated when generation changes
     result_cache: String,
     status_cache: String,
     is_running_cache: bool,
     connected_cache: bool,
+    last_generation: u64,
 }
 
 impl Default for IbexApp {
     fn default() -> Self {
+        // Single-threaded tokio runtime: 1 thread, tiny stack overhead
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+
         Self {
             connection_string: "mongodb://localhost:27017".into(),
             script: "show dbs".into(),
@@ -704,13 +944,15 @@ impl Default for IbexApp {
                 is_running: false,
                 status_message: "Not connected".into(),
                 connected: false,
+                generation: 0,
             })),
             connection: Arc::new(tokio::sync::Mutex::new(None)),
-            rt: Arc::new(Runtime::new().expect("Failed to create tokio runtime")),
+            rt: Arc::new(rt),
             result_cache: String::new(),
             status_cache: "Not connected".into(),
             is_running_cache: false,
             connected_cache: false,
+            last_generation: 0,
         }
     }
 }
@@ -720,47 +962,56 @@ impl IbexApp {
         let conn_str = self.connection_string.clone();
         let shared = Arc::clone(&self.shared);
         let connection = Arc::clone(&self.connection);
-        let rt = Arc::clone(&self.rt);
 
         {
             let mut s = shared.lock().unwrap();
             s.is_running = true;
             s.status_message = "Connecting...".into();
+            s.generation += 1;
         }
 
-        rt.spawn(async move {
+        self.rt.spawn(async move {
             match ClientOptions::parse(&conn_str).await {
-                Ok(opts) => match Client::with_options(opts) {
-                    Ok(client) => match client.list_database_names().await {
-                        Ok(_) => {
-                            *connection.lock().await = Some(MongoConnection {
-                                client,
-                                current_db: String::new(),
-                            });
-                            let mut s = shared.lock().unwrap();
-                            s.status_message = format!("Connected to {conn_str}");
-                            s.is_running = false;
-                            s.connected = true;
-                        }
+                Ok(mut opts) => {
+                    // Limit connection pool for minimal memory footprint
+                    opts.max_pool_size = Some(2);
+                    opts.min_pool_size = Some(0);
+                    match Client::with_options(opts) {
+                        Ok(client) => match client.list_database_names().await {
+                            Ok(_) => {
+                                *connection.lock().await = Some(MongoConnection {
+                                    client,
+                                    current_db: String::new(),
+                                });
+                                let mut s = shared.lock().unwrap();
+                                s.status_message = format!("Connected to {conn_str}");
+                                s.is_running = false;
+                                s.connected = true;
+                                s.generation += 1;
+                            }
+                            Err(e) => {
+                                let mut s = shared.lock().unwrap();
+                                s.status_message = format!("Connection failed: {e}");
+                                s.is_running = false;
+                                s.connected = false;
+                                s.generation += 1;
+                            }
+                        },
                         Err(e) => {
                             let mut s = shared.lock().unwrap();
-                            s.status_message = format!("Connection failed: {e}");
+                            s.status_message = format!("Client error: {e}");
                             s.is_running = false;
                             s.connected = false;
+                            s.generation += 1;
                         }
-                    },
-                    Err(e) => {
-                        let mut s = shared.lock().unwrap();
-                        s.status_message = format!("Client error: {e}");
-                        s.is_running = false;
-                        s.connected = false;
                     }
-                },
+                }
                 Err(e) => {
                     let mut s = shared.lock().unwrap();
                     s.status_message = format!("Parse error: {e}");
                     s.is_running = false;
                     s.connected = false;
+                    s.generation += 1;
                 }
             }
         });
@@ -775,19 +1026,20 @@ impl IbexApp {
         s.connected = false;
         s.status_message = "Disconnected".into();
         s.result_text.clear();
+        s.generation += 1;
     }
 
     fn execute_script(&mut self) {
         let script = self.script.clone();
         let shared = Arc::clone(&self.shared);
         let connection = Arc::clone(&self.connection);
-        let rt = Arc::clone(&self.rt);
 
         let ops = match parse_script(&script) {
             Ok(ops) => ops,
             Err(e) => {
                 let mut s = shared.lock().unwrap();
                 s.result_text = format!("Parse error: {e}");
+                s.generation += 1;
                 return;
             }
         };
@@ -796,9 +1048,10 @@ impl IbexApp {
             let mut s = shared.lock().unwrap();
             s.is_running = true;
             s.status_message = "Executing...".into();
+            s.generation += 1;
         }
 
-        rt.spawn(async move {
+        self.rt.spawn(async move {
             let mut conn_guard = connection.lock().await;
             if let Some(ref mut conn) = *conn_guard {
                 let results = execute_ops(conn, ops).await;
@@ -813,26 +1066,35 @@ impl IbexApp {
                 }
                 s.result_text = output;
                 s.is_running = false;
-                let db_name = conn.current_db.clone();
+                let db_name = &conn.current_db;
                 if db_name.is_empty() {
                     s.status_message = "Connected | no database selected".into();
                 } else {
                     s.status_message = format!("Connected | db: {db_name}");
                 }
+                s.generation += 1;
             } else {
                 let mut s = shared.lock().unwrap();
                 s.result_text = "Error: Not connected to MongoDB".into();
                 s.is_running = false;
+                s.generation += 1;
             }
         });
     }
 
+    /// Only copy from shared state when generation has changed -- avoids per-frame cloning.
     fn sync_from_shared(&mut self) {
         if let Ok(s) = self.shared.try_lock() {
-            self.result_cache.clone_from(&s.result_text);
-            self.status_cache.clone_from(&s.status_message);
+            // Always sync these lightweight fields
             self.is_running_cache = s.is_running;
             self.connected_cache = s.connected;
+
+            // Only clone strings when data actually changed
+            if s.generation != self.last_generation {
+                self.result_cache.clone_from(&s.result_text);
+                self.status_cache.clone_from(&s.status_message);
+                self.last_generation = s.generation;
+            }
         }
     }
 }
@@ -845,7 +1107,6 @@ impl eframe::App for IbexApp {
             ctx.request_repaint();
         }
 
-        // Ctrl+Enter shortcut
         if self.connected_cache
             && !self.is_running_cache
             && ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command)
@@ -855,6 +1116,8 @@ impl eframe::App for IbexApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let mono = egui::FontId::monospace(13.0);
+
         // ── Top panel: connection bar ──
         egui::Panel::top("connection_bar").show_inside(ui, |ui| {
             ui.add_space(4.0);
@@ -911,7 +1174,9 @@ impl eframe::App for IbexApp {
                         self.execute_script();
                     }
                     if ui.button("Clear Results").clicked() {
-                        self.shared.lock().unwrap().result_text.clear();
+                        let mut s = self.shared.lock().unwrap();
+                        s.result_text.clear();
+                        s.generation += 1;
                     }
                 });
             });
@@ -920,38 +1185,51 @@ impl eframe::App for IbexApp {
             let editor_height = (available * 0.35).max(80.0);
             let results_height = available - editor_height - 30.0;
 
-            // ── Script editor ──
+            // ── Script editor with syntax highlighting ──
+            let script_font = mono.clone();
             egui::ScrollArea::vertical()
                 .id_salt("script_scroll")
                 .max_height(editor_height)
                 .show(ui, |ui| {
+                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
+                        let layout_job = highlight_script(text.as_str(), script_font.clone());
+                        ui.ctx().fonts_mut(|f| f.layout_job(layout_job))
+                    };
                     ui.add(
                         egui::TextEdit::multiline(&mut self.script)
                             .desired_width(f32::INFINITY)
                             .desired_rows(8)
                             .font(egui::TextStyle::Monospace)
                             .hint_text("use mydb;\ndb.mycollection.find()")
-                            .code_editor(),
+                            .layouter(&mut layouter),
                     );
                 });
 
             ui.separator();
 
-            // ── Results ──
+            // ── Results with JSON syntax highlighting ──
             ui.horizontal(|ui| {
                 ui.heading("Results");
             });
 
+            let results_font = mono.clone();
             egui::ScrollArea::vertical()
                 .id_salt("results_scroll")
                 .max_height(results_height)
                 .show(ui, |ui| {
-                    let mut text = self.result_cache.clone();
+                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
+                        let layout_job = highlight_json(text.as_str(), results_font.clone());
+                        ui.ctx().fonts_mut(|f| f.layout_job(layout_job))
+                    };
+                    // Pass &mut directly -- no clone. TextEdit won't mutate in
+                    // practice since we don't process the output, and even if the
+                    // user types into results it just modifies the cache which gets
+                    // overwritten on next query.
                     ui.add(
-                        egui::TextEdit::multiline(&mut text)
+                        egui::TextEdit::multiline(&mut self.result_cache)
                             .desired_width(f32::INFINITY)
                             .font(egui::TextStyle::Monospace)
-                            .code_editor(),
+                            .layouter(&mut layouter),
                     );
                 });
         });
