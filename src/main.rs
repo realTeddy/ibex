@@ -7,7 +7,7 @@ use mongodb::bson::{Bson, Document};
 use mongodb::Client;
 use mongodb::options::ClientOptions;
 use serde_json::Value as JsonValue;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 
 // ─── Async MongoDB backend ───────────────────────────────────────────────────
 
@@ -919,7 +919,9 @@ struct IbexApp {
     script: String,
     shared: Arc<Mutex<SharedState>>,
     connection: Arc<tokio::sync::Mutex<Option<MongoConnection>>>,
-    rt: Arc<Runtime>,
+    rt_handle: Handle,
+    /// Keep the runtime thread alive for the lifetime of the app
+    _rt_thread: std::thread::JoinHandle<()>,
     // Cached copies -- only updated when generation changes
     result_cache: String,
     status_cache: String,
@@ -930,11 +932,24 @@ struct IbexApp {
 
 impl Default for IbexApp {
     fn default() -> Self {
-        // Single-threaded tokio runtime: 1 thread, tiny stack overhead
+        // Build a current_thread runtime and run it on a dedicated background thread.
+        // This gives us minimal thread/memory overhead while still allowing rt.spawn()
+        // futures to actually make progress.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime");
+
+        let handle = rt.handle().clone();
+
+        let rt_thread = std::thread::Builder::new()
+            .name("ibex-tokio".into())
+            .spawn(move || {
+                // block_on a future that never completes -- keeps the runtime
+                // alive and polling spawned tasks until the thread is dropped.
+                rt.block_on(std::future::pending::<()>());
+            })
+            .expect("Failed to spawn tokio runtime thread");
 
         Self {
             connection_string: "mongodb://localhost:27017".into(),
@@ -947,7 +962,8 @@ impl Default for IbexApp {
                 generation: 0,
             })),
             connection: Arc::new(tokio::sync::Mutex::new(None)),
-            rt: Arc::new(rt),
+            rt_handle: handle,
+            _rt_thread: rt_thread,
             result_cache: String::new(),
             status_cache: "Not connected".into(),
             is_running_cache: false,
@@ -970,7 +986,7 @@ impl IbexApp {
             s.generation += 1;
         }
 
-        self.rt.spawn(async move {
+        self.rt_handle.spawn(async move {
             match ClientOptions::parse(&conn_str).await {
                 Ok(mut opts) => {
                     // Limit connection pool for minimal memory footprint
@@ -1019,7 +1035,7 @@ impl IbexApp {
 
     fn disconnect(&mut self) {
         let connection = Arc::clone(&self.connection);
-        self.rt.spawn(async move {
+        self.rt_handle.spawn(async move {
             *connection.lock().await = None;
         });
         let mut s = self.shared.lock().unwrap();
@@ -1051,7 +1067,7 @@ impl IbexApp {
             s.generation += 1;
         }
 
-        self.rt.spawn(async move {
+        self.rt_handle.spawn(async move {
             let mut conn_guard = connection.lock().await;
             if let Some(ref mut conn) = *conn_guard {
                 let results = execute_ops(conn, ops).await;
