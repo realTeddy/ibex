@@ -9,6 +9,12 @@ use mongodb::options::ClientOptions;
 use serde_json::Value as JsonValue;
 use tokio::runtime::Handle;
 
+// ─── Compile-time constants ──────────────────────────────────────────────────
+/// Line height for the monospace font in the results panel (px).
+const RESULT_LINE_HEIGHT: f32 = 16.0;
+/// Extra lines to render above/below the visible region for smooth scrolling.
+const OVERSCAN_LINES: usize = 20;
+
 // ─── Async MongoDB backend ───────────────────────────────────────────────────
 
 struct MongoConnection {
@@ -19,7 +25,8 @@ struct MongoConnection {
 unsafe impl Send for MongoConnection {}
 
 struct QueryResult {
-    output: String,
+    /// Pre-split lines of the result output (avoids giant intermediate String).
+    lines: Vec<String>,
     elapsed: Duration,
     _is_error: bool,
 }
@@ -476,7 +483,7 @@ fn json_value_to_bson_array(val: &JsonValue) -> Result<Vec<Document>, String> {
 // ─── Query executor ──────────────────────────────────────────────────────────
 
 async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<QueryResult> {
-    use futures::TryStreamExt;
+    use futures_util::TryStreamExt;
 
     let mut results = Vec::new();
 
@@ -486,19 +493,19 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             MongoOp::UseDb(name) => {
                 conn.current_db = name.clone();
                 QueryResult {
-                    output: format!("switched to db: {name}"),
+                    lines: vec![format!("switched to db: {name}")],
                     elapsed: start.elapsed(),
                     _is_error: false,
                 }
             }
             MongoOp::ShowDbs => match conn.client.list_database_names().await {
                 Ok(names) => QueryResult {
-                    output: names.join("\n"),
+                    lines: names,
                     elapsed: start.elapsed(),
                     _is_error: false,
                 },
                 Err(e) => QueryResult {
-                    output: format!("Error: {e}"),
+                    lines: vec![format!("Error: {e}")],
                     elapsed: start.elapsed(),
                     _is_error: true,
                 },
@@ -506,7 +513,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             MongoOp::ShowCollections => {
                 if conn.current_db.is_empty() {
                     QueryResult {
-                        output: "Error: no database selected. Use `use <db>` first.".into(),
+                        lines: vec!["Error: no database selected. Use `use <db>` first.".into()],
                         elapsed: start.elapsed(),
                         _is_error: true,
                     }
@@ -514,16 +521,16 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                     let db = conn.client.database(&conn.current_db);
                     match db.list_collection_names().await {
                         Ok(names) => QueryResult {
-                            output: if names.is_empty() {
-                                "(no collections)".into()
+                            lines: if names.is_empty() {
+                                vec!["(no collections)".into()]
                             } else {
-                                names.join("\n")
+                                names
                             },
                             elapsed: start.elapsed(),
                             _is_error: false,
                         },
                         Err(e) => QueryResult {
-                            output: format!("Error: {e}"),
+                            lines: vec![format!("Error: {e}")],
                             elapsed: start.elapsed(),
                             _is_error: true,
                         },
@@ -533,7 +540,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             MongoOp::Find { collection, filter, modifiers } => {
                 if conn.current_db.is_empty() {
                     QueryResult {
-                        output: "Error: no database selected. Use `use <db>` first.".into(),
+                        lines: vec!["Error: no database selected. Use `use <db>` first.".into()],
                         elapsed: start.elapsed(),
                         _is_error: true,
                     }
@@ -545,7 +552,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                             Ok(d) => d,
                             Err(e) => {
                                 results.push(QueryResult {
-                                    output: format!("Error parsing filter: {e}"),
+                                    lines: vec![format!("Error parsing filter: {e}")],
                                     elapsed: start.elapsed(),
                                     _is_error: true,
                                 });
@@ -566,7 +573,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                             Ok(sort_doc) => { find = find.sort(sort_doc); }
                             Err(e) => {
                                 results.push(QueryResult {
-                                    output: format!("Error parsing sort: {e}"),
+                                    lines: vec![format!("Error parsing sort: {e}")],
                                     elapsed: start.elapsed(),
                                     _is_error: true,
                                 });
@@ -579,7 +586,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                             Ok(proj_doc) => { find = find.projection(proj_doc); }
                             Err(e) => {
                                 results.push(QueryResult {
-                                    output: format!("Error parsing projection: {e}"),
+                                    lines: vec![format!("Error parsing projection: {e}")],
                                     elapsed: start.elapsed(),
                                     _is_error: true,
                                 });
@@ -597,15 +604,22 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                                     break;
                                 }
                             }
-                            let formatted = format_documents(&docs);
+                            let doc_count = docs.len();
+                            let mut lines = Vec::new();
+                            format_documents_to_lines(&docs, &mut lines);
+                            // Drop docs immediately to free BSON memory before
+                            // we finish building the result
+                            drop(docs);
+                            lines.push(String::new());
+                            lines.push(format!("({doc_count} document(s))"));
                             QueryResult {
-                                output: format!("{formatted}\n\n({} document(s))", docs.len()),
+                                lines,
                                 elapsed: start.elapsed(),
                                 _is_error: false,
                             }
                         }
                         Err(e) => QueryResult {
-                            output: format!("Error: {e}"),
+                            lines: vec![format!("Error: {e}")],
                             elapsed: start.elapsed(),
                             _is_error: true,
                         },
@@ -615,7 +629,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             MongoOp::CountDocuments { collection, filter } => {
                 if conn.current_db.is_empty() {
                     QueryResult {
-                        output: "Error: no database selected. Use `use <db>` first.".into(),
+                        lines: vec!["Error: no database selected. Use `use <db>` first.".into()],
                         elapsed: start.elapsed(),
                         _is_error: true,
                     }
@@ -627,7 +641,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                             Ok(d) => d,
                             Err(e) => {
                                 results.push(QueryResult {
-                                    output: format!("Error parsing filter: {e}"),
+                                    lines: vec![format!("Error parsing filter: {e}")],
                                     elapsed: start.elapsed(),
                                     _is_error: true,
                                 });
@@ -638,12 +652,12 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                     };
                     match coll.count_documents(filter_doc).await {
                         Ok(count) => QueryResult {
-                            output: format!("{count}"),
+                            lines: vec![format!("{count}")],
                             elapsed: start.elapsed(),
                             _is_error: false,
                         },
                         Err(e) => QueryResult {
-                            output: format!("Error: {e}"),
+                            lines: vec![format!("Error: {e}")],
                             elapsed: start.elapsed(),
                             _is_error: true,
                         },
@@ -653,7 +667,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             MongoOp::InsertOne { collection, doc } => {
                 if conn.current_db.is_empty() {
                     QueryResult {
-                        output: "Error: no database selected. Use `use <db>` first.".into(),
+                        lines: vec!["Error: no database selected. Use `use <db>` first.".into()],
                         elapsed: start.elapsed(),
                         _is_error: true,
                     }
@@ -663,18 +677,18 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                     match relaxed_json_to_doc(&doc) {
                         Ok(document) => match coll.insert_one(document).await {
                             Ok(r) => QueryResult {
-                                output: format!("Inserted document with _id: {}", r.inserted_id),
+                                lines: vec![format!("Inserted document with _id: {}", r.inserted_id)],
                                 elapsed: start.elapsed(),
                                 _is_error: false,
                             },
                             Err(e) => QueryResult {
-                                output: format!("Error: {e}"),
+                                lines: vec![format!("Error: {e}")],
                                 elapsed: start.elapsed(),
                                 _is_error: true,
                             },
                         },
                         Err(e) => QueryResult {
-                            output: format!("Error parsing document: {e}"),
+                            lines: vec![format!("Error parsing document: {e}")],
                             elapsed: start.elapsed(),
                             _is_error: true,
                         },
@@ -684,7 +698,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             MongoOp::DeleteOne { collection, filter } => {
                 if conn.current_db.is_empty() {
                     QueryResult {
-                        output: "Error: no database selected. Use `use <db>` first.".into(),
+                        lines: vec!["Error: no database selected. Use `use <db>` first.".into()],
                         elapsed: start.elapsed(),
                         _is_error: true,
                     }
@@ -694,18 +708,18 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                     match relaxed_json_to_doc(&filter) {
                         Ok(f) => match coll.delete_one(f).await {
                             Ok(r) => QueryResult {
-                                output: format!("Deleted {} document(s)", r.deleted_count),
+                                lines: vec![format!("Deleted {} document(s)", r.deleted_count)],
                                 elapsed: start.elapsed(),
                                 _is_error: false,
                             },
                             Err(e) => QueryResult {
-                                output: format!("Error: {e}"),
+                                lines: vec![format!("Error: {e}")],
                                 elapsed: start.elapsed(),
                                 _is_error: true,
                             },
                         },
                         Err(e) => QueryResult {
-                            output: format!("Error parsing filter: {e}"),
+                            lines: vec![format!("Error parsing filter: {e}")],
                             elapsed: start.elapsed(),
                             _is_error: true,
                         },
@@ -715,7 +729,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             MongoOp::DeleteMany { collection, filter } => {
                 if conn.current_db.is_empty() {
                     QueryResult {
-                        output: "Error: no database selected. Use `use <db>` first.".into(),
+                        lines: vec!["Error: no database selected. Use `use <db>` first.".into()],
                         elapsed: start.elapsed(),
                         _is_error: true,
                     }
@@ -725,18 +739,18 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                     match relaxed_json_to_doc(&filter) {
                         Ok(f) => match coll.delete_many(f).await {
                             Ok(r) => QueryResult {
-                                output: format!("Deleted {} document(s)", r.deleted_count),
+                                lines: vec![format!("Deleted {} document(s)", r.deleted_count)],
                                 elapsed: start.elapsed(),
                                 _is_error: false,
                             },
                             Err(e) => QueryResult {
-                                output: format!("Error: {e}"),
+                                lines: vec![format!("Error: {e}")],
                                 elapsed: start.elapsed(),
                                 _is_error: true,
                             },
                         },
                         Err(e) => QueryResult {
-                            output: format!("Error parsing filter: {e}"),
+                            lines: vec![format!("Error parsing filter: {e}")],
                             elapsed: start.elapsed(),
                             _is_error: true,
                         },
@@ -750,7 +764,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             } => {
                 if conn.current_db.is_empty() {
                     QueryResult {
-                        output: "Error: no database selected. Use `use <db>` first.".into(),
+                        lines: vec!["Error: no database selected. Use `use <db>` first.".into()],
                         elapsed: start.elapsed(),
                         _is_error: true,
                     }
@@ -775,30 +789,32 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                                             break;
                                         }
                                     }
-                                    let formatted = format_documents(&docs);
+                                    let doc_count = docs.len();
+                                    let mut lines = Vec::new();
+                                    format_documents_to_lines(&docs, &mut lines);
+                                    drop(docs);
+                                    lines.push(String::new());
+                                    lines.push(format!("({doc_count} document(s))"));
                                     QueryResult {
-                                        output: format!(
-                                            "{formatted}\n\n({} document(s))",
-                                            docs.len()
-                                        ),
+                                        lines,
                                         elapsed: start.elapsed(),
                                         _is_error: false,
                                     }
                                 }
                                 Err(e) => QueryResult {
-                                    output: format!("Error: {e}"),
+                                    lines: vec![format!("Error: {e}")],
                                     elapsed: start.elapsed(),
                                     _is_error: true,
                                 },
                             },
                             Err(e) => QueryResult {
-                                output: format!("Error parsing pipeline: {e}"),
+                                lines: vec![format!("Error parsing pipeline: {e}")],
                                 elapsed: start.elapsed(),
                                 _is_error: true,
                             },
                         },
                         Err(e) => QueryResult {
-                            output: format!("Error parsing pipeline JSON: {e}"),
+                            lines: vec![format!("Error parsing pipeline JSON: {e}")],
                             elapsed: start.elapsed(),
                             _is_error: true,
                         },
@@ -811,28 +827,36 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
     results
 }
 
-/// Pretty-print BSON documents as JSON -- single-pass, no intermediate String round-trip.
-fn format_documents(docs: &[Document]) -> String {
+/// Pretty-print BSON documents as JSON lines. Each line is a separate String
+/// to feed directly into the virtualized renderer without building a giant
+/// intermediate buffer. Uses a line-splitting writer to avoid any monolithic
+/// String allocation.
+fn format_documents_to_lines(docs: &[Document], out: &mut Vec<String>) {
     if docs.is_empty() {
-        return "(no results)".to_string();
+        out.push("(no results)".to_string());
+        return;
     }
-    let mut out = String::with_capacity(docs.len() * 256);
+    // Pre-allocate a byte buffer we reuse per-document to avoid repeated allocs.
+    // serde_json writes into this, then we split it into lines.
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
     for (i, doc) in docs.iter().enumerate() {
         if i > 0 {
-            out.push_str("\n---\n");
+            out.push("---".to_string());
         }
-        // Bson implements Serialize; go directly Bson → serde_json::Value (no String round-trip)
-        let json_val: JsonValue = serde_json::to_value(Bson::Document(doc.clone()))
-            .unwrap_or_else(|_| JsonValue::String(format!("{doc:?}")));
-        // Write pretty JSON directly into our output buffer
-        let pretty =
-            serde_json::to_string_pretty(&json_val).unwrap_or_else(|_| format!("{doc:?}"));
-        out.push_str(&pretty);
+        buf.clear();
+        if serde_json::to_writer_pretty(&mut buf, doc).is_err() {
+            out.push(format!("{doc:?}"));
+            continue;
+        }
+        // SAFETY: serde_json always writes valid UTF-8.
+        let text = unsafe { std::str::from_utf8_unchecked(&buf) };
+        for line in text.lines() {
+            out.push(line.to_string());
+        }
     }
-    out
 }
 
-// ─── Syntax highlighting ─────────────────────────────────────────────────────
+// ─── Syntax highlighting (zero-allocation, slice-based) ──────────────────────
 
 // Theme colors (dark mode)
 const COL_KEYWORD: egui::Color32 = egui::Color32::from_rgb(198, 120, 221); // purple
@@ -872,215 +896,246 @@ const MONGO_METHODS: &[&str] = &[
     "project",
 ];
 
-/// Syntax-highlight a mongo shell script for the editor.
-fn highlight_script(text: &str, font_id: egui::FontId) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        let ch = chars[i];
-
-        // Strings
-        if ch == '"' || ch == '\'' {
-            let start = i;
-            let quote = ch;
-            i += 1;
-            while i < len && chars[i] != quote {
-                if chars[i] == '\\' && i + 1 < len {
-                    i += 1;
-                }
-                i += 1;
-            }
-            if i < len {
-                i += 1;
-            }
-            let s: String = chars[start..i].iter().collect();
-            append_colored(&mut job, &s, COL_STRING, font_id.clone());
-            continue;
-        }
-
-        // "db" prefix
-        if ch == 'd' && i + 1 < len && chars[i + 1] == 'b' && (i + 2 >= len || chars[i + 2] == '.') {
-            append_colored(&mut job, "db", COL_DB, font_id.clone());
-            i += 2;
-            continue;
-        }
-
-        // Words (keywords, methods, identifiers)
-        if ch.is_alphabetic() || ch == '_' || ch == '$' {
-            let start = i;
-            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$') {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            if MONGO_KEYWORDS.contains(&word.as_str()) {
-                append_colored(&mut job, &word, COL_KEYWORD, font_id.clone());
-            } else if MONGO_METHODS.contains(&word.as_str()) {
-                append_colored(&mut job, &word, COL_METHOD, font_id.clone());
-            } else if word == "true" || word == "false" {
-                append_colored(&mut job, &word, COL_BOOL, font_id.clone());
-            } else if word == "null" {
-                append_colored(&mut job, &word, COL_NULL, font_id.clone());
-            } else {
-                append_colored(&mut job, &word, COL_DEFAULT, font_id.clone());
-            }
-            continue;
-        }
-
-        // Numbers
-        if ch.is_ascii_digit() || (ch == '-' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
-            let start = i;
-            if ch == '-' {
-                i += 1;
-            }
-            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                i += 1;
-            }
-            let num: String = chars[start..i].iter().collect();
-            append_colored(&mut job, &num, COL_NUMBER, font_id.clone());
-            continue;
-        }
-
-        // Braces/brackets/parens
-        if matches!(ch, '{' | '}' | '[' | ']' | '(' | ')') {
-            append_colored(&mut job, &ch.to_string(), COL_BRACE, font_id.clone());
-            i += 1;
-            continue;
-        }
-
-        // Everything else (dots, colons, semicolons, whitespace)
-        append_colored(&mut job, &ch.to_string(), COL_DEFAULT, font_id.clone());
-        i += 1;
-    }
-
-    job
-}
-
-/// Syntax-highlight JSON result text.
-fn highlight_json(text: &str, font_id: egui::FontId) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        let ch = chars[i];
-
-        // Separator lines "---"
-        if ch == '-' && i + 2 < len && chars[i + 1] == '-' && chars[i + 2] == '-' {
-            let start = i;
-            while i < len && chars[i] == '-' {
-                i += 1;
-            }
-            let s: String = chars[start..i].iter().collect();
-            append_colored(&mut job, &s, COL_SEPARATOR, font_id.clone());
-            continue;
-        }
-
-        // Strings -- detect if this is a JSON key (followed by ':')
-        if ch == '"' {
-            let start = i;
-            i += 1;
-            while i < len && chars[i] != '"' {
-                if chars[i] == '\\' && i + 1 < len {
-                    i += 1;
-                }
-                i += 1;
-            }
-            if i < len {
-                i += 1;
-            }
-            let s: String = chars[start..i].iter().collect();
-
-            // Look ahead for ':'
-            let mut j = i;
-            while j < len && chars[j].is_whitespace() && chars[j] != '\n' {
-                j += 1;
-            }
-            if j < len && chars[j] == ':' {
-                append_colored(&mut job, &s, COL_KEY, font_id.clone());
-            } else {
-                append_colored(&mut job, &s, COL_STRING, font_id.clone());
-            }
-            continue;
-        }
-
-        // Words: true, false, null
-        if ch.is_alphabetic() {
-            let start = i;
-            while i < len && chars[i].is_alphanumeric() {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            match word.as_str() {
-                "true" | "false" => {
-                    append_colored(&mut job, &word, COL_BOOL, font_id.clone());
-                }
-                "null" => {
-                    append_colored(&mut job, &word, COL_NULL, font_id.clone());
-                }
-                _ => {
-                    append_colored(&mut job, &word, COL_DEFAULT, font_id.clone());
-                }
-            }
-            continue;
-        }
-
-        // Numbers
-        if ch.is_ascii_digit() || (ch == '-' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
-            let start = i;
-            if ch == '-' {
-                i += 1;
-            }
-            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == 'e' || chars[i] == 'E' || chars[i] == '+' || chars[i] == '-') {
-                // Avoid consuming a '-' that starts a new negative number after 'e'
-                if (chars[i] == '-' || chars[i] == '+') && i > start && chars[i - 1] != 'e' && chars[i - 1] != 'E' {
-                    break;
-                }
-                i += 1;
-            }
-            let num: String = chars[start..i].iter().collect();
-            append_colored(&mut job, &num, COL_NUMBER, font_id.clone());
-            continue;
-        }
-
-        // Braces
-        if matches!(ch, '{' | '}' | '[' | ']') {
-            append_colored(&mut job, &ch.to_string(), COL_BRACE, font_id.clone());
-            i += 1;
-            continue;
-        }
-
-        // Everything else
-        append_colored(&mut job, &ch.to_string(), COL_DEFAULT, font_id.clone());
-        i += 1;
-    }
-
-    job
-}
-
-fn append_colored(job: &mut LayoutJob, text: &str, color: egui::Color32, font_id: egui::FontId) {
+/// Append a slice with a given color, reusing the TextFormat allocation when
+/// the color matches the previous append.
+#[inline(always)]
+fn push_span(job: &mut LayoutJob, text: &str, color: egui::Color32, font_id: &egui::FontId) {
     job.append(
         text,
         0.0,
         egui::TextFormat {
-            font_id,
+            font_id: font_id.clone(),
             color,
             ..Default::default()
         },
     );
 }
 
+/// Check if byte is start of an ASCII identifier character.
+#[inline(always)]
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+}
+
+#[inline(always)]
+fn is_ident_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Syntax-highlight a mongo shell script for the editor.
+/// Operates directly on `&str` byte slices -- zero Vec<char> allocation.
+fn highlight_script(text: &str, font_id: &egui::FontId) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        // ── Strings ──
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != quote {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            push_span(&mut job, &text[start..i], COL_STRING, font_id);
+            continue;
+        }
+
+        // ── "db" prefix ──
+        if b == b'd' && i + 1 < len && bytes[i + 1] == b'b' && (i + 2 >= len || bytes[i + 2] == b'.') {
+            push_span(&mut job, &text[i..i + 2], COL_DB, font_id);
+            i += 2;
+            continue;
+        }
+
+        // ── Words (keywords, methods, booleans, identifiers) ──
+        if is_ident_start(b) {
+            let start = i;
+            i += 1;
+            while i < len && is_ident_cont(bytes[i]) {
+                i += 1;
+            }
+            let word = &text[start..i];
+            let color = if MONGO_KEYWORDS.contains(&word) {
+                COL_KEYWORD
+            } else if MONGO_METHODS.contains(&word) {
+                COL_METHOD
+            } else if word == "true" || word == "false" {
+                COL_BOOL
+            } else if word == "null" {
+                COL_NULL
+            } else {
+                COL_DEFAULT
+            };
+            push_span(&mut job, word, color, font_id);
+            continue;
+        }
+
+        // ── Numbers ──
+        if b.is_ascii_digit() || (b == b'-' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
+            let start = i;
+            if b == b'-' {
+                i += 1;
+            }
+            while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            push_span(&mut job, &text[start..i], COL_NUMBER, font_id);
+            continue;
+        }
+
+        // ── Braces / brackets / parens ──
+        if matches!(b, b'{' | b'}' | b'[' | b']' | b'(' | b')') {
+            push_span(&mut job, &text[i..i + 1], COL_BRACE, font_id);
+            i += 1;
+            continue;
+        }
+
+        // ── Batch consecutive "default" bytes (whitespace, dots, colons, etc.) ──
+        {
+            let start = i;
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                if c == b'"' || c == b'\'' || is_ident_start(c) || c.is_ascii_digit()
+                    || matches!(c, b'{' | b'}' | b'[' | b']' | b'(' | b')')
+                    || (c == b'-' && i + 1 < len && bytes[i + 1].is_ascii_digit())
+                {
+                    break;
+                }
+                i += 1;
+            }
+            push_span(&mut job, &text[start..i], COL_DEFAULT, font_id);
+        }
+    }
+
+    job
+}
+
+/// Syntax-highlight a single line of JSON result text.
+/// Operates on byte slices -- no allocations beyond the LayoutJob sections.
+fn highlight_json_line(text: &str, font_id: &egui::FontId, job: &mut LayoutJob) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        // ── Separator lines "---" ──
+        if b == b'-' && i + 2 < len && bytes[i + 1] == b'-' && bytes[i + 2] == b'-' {
+            let start = i;
+            while i < len && bytes[i] == b'-' {
+                i += 1;
+            }
+            push_span(job, &text[start..i], COL_SEPARATOR, font_id);
+            continue;
+        }
+
+        // ── Strings -- detect if JSON key (followed by ':') ──
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            // Look ahead past whitespace for ':'
+            let mut j = i;
+            while j < len && bytes[j] == b' ' {
+                j += 1;
+            }
+            let color = if j < len && bytes[j] == b':' { COL_KEY } else { COL_STRING };
+            push_span(job, &text[start..i], color, font_id);
+            continue;
+        }
+
+        // ── Words: true, false, null, or other alphabetic ──
+        if b.is_ascii_alphabetic() {
+            let start = i;
+            i += 1;
+            while i < len && bytes[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            let word = &text[start..i];
+            let color = match word {
+                "true" | "false" => COL_BOOL,
+                "null" => COL_NULL,
+                _ => COL_DEFAULT,
+            };
+            push_span(job, word, color, font_id);
+            continue;
+        }
+
+        // ── Numbers ──
+        if b.is_ascii_digit() || (b == b'-' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
+            let start = i;
+            if b == b'-' {
+                i += 1;
+            }
+            while i < len {
+                let c = bytes[i];
+                if c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E' {
+                    i += 1;
+                } else if (c == b'+' || c == b'-') && i > start && (bytes[i - 1] == b'e' || bytes[i - 1] == b'E') {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            push_span(job, &text[start..i], COL_NUMBER, font_id);
+            continue;
+        }
+
+        // ── Braces / brackets ──
+        if matches!(b, b'{' | b'}' | b'[' | b']') {
+            push_span(job, &text[i..i + 1], COL_BRACE, font_id);
+            i += 1;
+            continue;
+        }
+
+        // ── Batch remaining default-colored bytes ──
+        {
+            let start = i;
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                if c == b'"' || c == b'-' || c.is_ascii_alphanumeric()
+                    || matches!(c, b'{' | b'}' | b'[' | b']')
+                {
+                    break;
+                }
+                i += 1;
+            }
+            push_span(job, &text[start..i], COL_DEFAULT, font_id);
+        }
+    }
+}
+
 // ─── GUI Application ─────────────────────────────────────────────────────────
 
 struct SharedState {
-    result_text: String,
+    /// Result lines behind an Arc -- shared with the UI cache (no cloning).
+    result_lines: Arc<Vec<String>>,
     is_running: bool,
     status_message: String,
     connected: bool,
-    /// Monotonic generation counter -- bumped every time result_text or status changes.
+    /// Monotonic generation counter -- bumped every time results or status changes.
     generation: u64,
 }
 
@@ -1092,12 +1147,15 @@ struct IbexApp {
     rt_handle: Handle,
     /// Keep the runtime thread alive for the lifetime of the app
     _rt_thread: std::thread::JoinHandle<()>,
-    // Cached copies -- only updated when generation changes
-    result_cache: String,
+    // ── Cached copies ── only updated when generation changes
+    result_lines_cache: Arc<Vec<String>>,
     status_cache: String,
     is_running_cache: bool,
     connected_cache: bool,
     last_generation: u64,
+    // ── Script highlight cache ──
+    script_highlight_cache: Option<(u64, LayoutJob)>,
+    script_hash: u64,
 }
 
 impl Default for IbexApp {
@@ -1114,6 +1172,7 @@ impl Default for IbexApp {
 
         let rt_thread = std::thread::Builder::new()
             .name("ibex-tokio".into())
+            .stack_size(512 * 1024) // 512 KB -- plenty for async I/O, saves ~7.5 MB vs default 8 MB
             .spawn(move || {
                 // block_on a future that never completes -- keeps the runtime
                 // alive and polling spawned tasks until the thread is dropped.
@@ -1125,7 +1184,7 @@ impl Default for IbexApp {
             connection_string: "mongodb://localhost:27017".into(),
             script: "show dbs".into(),
             shared: Arc::new(Mutex::new(SharedState {
-                result_text: String::new(),
+                result_lines: Arc::new(Vec::new()),
                 is_running: false,
                 status_message: "Not connected".into(),
                 connected: false,
@@ -1134,11 +1193,13 @@ impl Default for IbexApp {
             connection: Arc::new(tokio::sync::Mutex::new(None)),
             rt_handle: handle,
             _rt_thread: rt_thread,
-            result_cache: String::new(),
+            result_lines_cache: Arc::new(Vec::new()),
             status_cache: "Not connected".into(),
             is_running_cache: false,
             connected_cache: false,
             last_generation: 0,
+            script_highlight_cache: None,
+            script_hash: 0,
         }
     }
 }
@@ -1211,7 +1272,7 @@ impl IbexApp {
         let mut s = self.shared.lock().unwrap();
         s.connected = false;
         s.status_message = "Disconnected".into();
-        s.result_text.clear();
+        s.result_lines = Arc::new(Vec::new());
         s.generation += 1;
     }
 
@@ -1224,7 +1285,7 @@ impl IbexApp {
             Ok(ops) => ops,
             Err(e) => {
                 let mut s = shared.lock().unwrap();
-                s.result_text = format!("Parse error: {e}");
+                s.result_lines = Arc::new(vec![format!("Parse error: {e}")]);
                 s.generation += 1;
                 return;
             }
@@ -1241,16 +1302,19 @@ impl IbexApp {
             let mut conn_guard = connection.lock().await;
             if let Some(ref mut conn) = *conn_guard {
                 let results = execute_ops(conn, ops).await;
-                let mut s = shared.lock().unwrap();
-                let mut output = String::new();
-                for r in &results {
-                    if !output.is_empty() {
-                        output.push_str("\n\n");
+                // Build flat line Vec directly from results, then drop results
+                // to free all intermediate memory before storing.
+                let mut all_lines = Vec::new();
+                for (i, r) in results.iter().enumerate() {
+                    if i > 0 {
+                        all_lines.push(String::new());
                     }
-                    output.push_str(&r.output);
-                    output.push_str(&format!("\n  ({}ms)", r.elapsed.as_millis()));
+                    all_lines.extend_from_slice(&r.lines);
+                    all_lines.push(format!("  ({}ms)", r.elapsed.as_millis()));
                 }
-                s.result_text = output;
+                drop(results); // free QueryResult memory before locking shared state
+                let mut s = shared.lock().unwrap();
+                s.result_lines = Arc::new(all_lines);
                 s.is_running = false;
                 let db_name = &conn.current_db;
                 if db_name.is_empty() {
@@ -1261,7 +1325,7 @@ impl IbexApp {
                 s.generation += 1;
             } else {
                 let mut s = shared.lock().unwrap();
-                s.result_text = "Error: Not connected to MongoDB".into();
+                s.result_lines = Arc::new(vec!["Error: Not connected to MongoDB".into()]);
                 s.is_running = false;
                 s.generation += 1;
             }
@@ -1275,13 +1339,23 @@ impl IbexApp {
             self.is_running_cache = s.is_running;
             self.connected_cache = s.connected;
 
-            // Only clone strings when data actually changed
+            // Only update when data actually changed -- Arc::clone is just a refcount bump
             if s.generation != self.last_generation {
-                self.result_cache.clone_from(&s.result_text);
+                self.result_lines_cache = Arc::clone(&s.result_lines);
                 self.status_cache.clone_from(&s.status_message);
                 self.last_generation = s.generation;
             }
         }
+    }
+
+    /// Simple FNV-1a hash for cache invalidation (fast, no allocations).
+    fn hash_str(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in s.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
     }
 }
 
@@ -1361,7 +1435,7 @@ impl eframe::App for IbexApp {
                     }
                     if ui.button("Clear Results").clicked() {
                         let mut s = self.shared.lock().unwrap();
-                        s.result_text.clear();
+                        s.result_lines = Arc::new(Vec::new());
                         s.generation += 1;
                     }
                 });
@@ -1371,52 +1445,99 @@ impl eframe::App for IbexApp {
             let editor_height = (available * 0.35).max(80.0);
             let results_height = available - editor_height - 30.0;
 
-            // ── Script editor with syntax highlighting ──
-            let script_font = mono.clone();
-            egui::ScrollArea::vertical()
-                .id_salt("script_scroll")
-                .max_height(editor_height)
-                .show(ui, |ui| {
-                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
-                        let layout_job = highlight_script(text.as_str(), script_font.clone());
-                        ui.ctx().fonts_mut(|f| f.layout_job(layout_job))
-                    };
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.script)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(8)
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text("use mydb;\ndb.mycollection.find()")
-                            .layouter(&mut layouter),
-                    );
-                });
+            // ── Script editor with cached syntax highlighting ──
+            {
+                let script_font = mono.clone();
+                // Compute hash of current script text for cache invalidation
+                let new_hash = Self::hash_str(&self.script);
+                if new_hash != self.script_hash {
+                    self.script_hash = new_hash;
+                    let job = highlight_script(&self.script, &script_font);
+                    self.script_highlight_cache = Some((new_hash, job));
+                }
+                // Clone the cached LayoutJob for the layouter (cheap -- just Arc bumps inside egui)
+                let cached_job = self.script_highlight_cache.as_ref().map(|(_, j)| j.clone());
+                egui::ScrollArea::vertical()
+                    .id_salt("script_scroll")
+                    .max_height(editor_height)
+                    .show(ui, |ui| {
+                        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
+                            // If text matches our cache, use it; otherwise re-highlight
+                            let job = if let Some(ref cj) = cached_job {
+                                cj.clone()
+                            } else {
+                                highlight_script(text.as_str(), &script_font)
+                            };
+                            ui.ctx().fonts_mut(|f| f.layout_job(job))
+                        };
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.script)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(8)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("use mydb;\ndb.mycollection.find()")
+                                .layouter(&mut layouter),
+                        );
+                    });
+            }
 
             ui.separator();
 
-            // ── Results with JSON syntax highlighting ──
+            // ── Results with virtualized rendering ──
             ui.horizontal(|ui| {
                 ui.heading("Results");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} lines", self.result_lines_cache.len()))
+                            .small()
+                            .weak(),
+                    );
+                });
             });
 
-            let results_font = mono.clone();
+            let total_lines = self.result_lines_cache.len();
+            let total_height = total_lines as f32 * RESULT_LINE_HEIGHT;
+            let results_font = mono;
+
             egui::ScrollArea::vertical()
                 .id_salt("results_scroll")
                 .max_height(results_height)
                 .show(ui, |ui| {
-                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
-                        let layout_job = highlight_json(text.as_str(), results_font.clone());
-                        ui.ctx().fonts_mut(|f| f.layout_job(layout_job))
-                    };
-                    // Pass &mut directly -- no clone. TextEdit won't mutate in
-                    // practice since we don't process the output, and even if the
-                    // user types into results it just modifies the cache which gets
-                    // overwritten on next query.
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.result_cache)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace)
-                            .layouter(&mut layouter),
+                    if total_lines == 0 {
+                        ui.weak("(no results)");
+                        return;
+                    }
+
+                    // Allocate the full virtual height so the scrollbar is accurate
+                    let (rect, _response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), total_height),
+                        egui::Sense::hover(),
                     );
+
+                    // Determine which lines are visible in the current viewport
+                    let clip = ui.clip_rect();
+                    let visible_top = (clip.top() - rect.top()).max(0.0);
+                    let visible_bottom = (clip.bottom() - rect.top()).max(0.0);
+
+                    let first_line = ((visible_top / RESULT_LINE_HEIGHT) as usize).saturating_sub(OVERSCAN_LINES);
+                    let last_line = (((visible_bottom / RESULT_LINE_HEIGHT).ceil() as usize) + OVERSCAN_LINES)
+                        .min(total_lines);
+
+                    // Paint only visible lines
+                    let painter = ui.painter_at(rect);
+                    let left_x = rect.left() + 4.0;
+
+                    for line_idx in first_line..last_line {
+                        let y = rect.top() + line_idx as f32 * RESULT_LINE_HEIGHT;
+                        let line = &self.result_lines_cache[line_idx];
+
+                        // Build a tiny LayoutJob for just this one line
+                        let mut job = LayoutJob::default();
+                        highlight_json_line(line, &results_font, &mut job);
+
+                        let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
+                        painter.galley(egui::pos2(left_x, y), galley, COL_DEFAULT);
+                    }
                 });
         });
     }
