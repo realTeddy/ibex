@@ -24,11 +24,22 @@ struct QueryResult {
     _is_error: bool,
 }
 
+/// Optional modifiers that can be chained after a primary query method.
+/// e.g. `db.coll.find({}).limit(100).skip(10).sort({name: 1})`
+#[derive(Default, Clone)]
+struct QueryModifiers {
+    limit: Option<i64>,
+    skip: Option<u64>,
+    sort: Option<String>,
+    projection: Option<String>,
+}
+
 enum MongoOp {
     UseDb(String),
     Find {
         collection: String,
         filter: Option<String>,
+        modifiers: QueryModifiers,
     },
     CountDocuments {
         collection: String,
@@ -49,6 +60,7 @@ enum MongoOp {
     Aggregate {
         collection: String,
         pipeline: String,
+        modifiers: QueryModifiers,
     },
     ShowDbs,
     ShowCollections,
@@ -143,25 +155,26 @@ fn split_statements(script: &str) -> Vec<String> {
 }
 
 fn parse_db_command(stmt: &str) -> Result<MongoOp, String> {
-    let after_db = &stmt[3..];
+    let after_db = &stmt[3..]; // skip "db."
     let dot_pos = after_db
         .find('.')
         .ok_or("Expected db.<collection>.<method>(...)")?;
     let collection = after_db[..dot_pos].to_string();
     let rest = &after_db[dot_pos + 1..];
 
-    let paren_pos = rest
-        .find('(')
-        .ok_or("Expected method call with parentheses")?;
-    let method = &rest[..paren_pos];
-    let args_raw = &rest[paren_pos..];
-
-    if !args_raw.starts_with('(') || !args_raw.ends_with(')') {
-        return Err("Malformed method call".into());
+    // Parse chained method calls: method(args).method2(args2).method3(args3)...
+    let calls = parse_chained_calls(rest)?;
+    if calls.is_empty() {
+        return Err("Expected method call with parentheses".into());
     }
-    let args = args_raw[1..args_raw.len() - 1].trim();
 
-    match method {
+    let (method, args) = &calls[0];
+    let args = args.trim();
+
+    // Parse any trailing modifier calls (.limit, .skip, .sort, .projection)
+    let modifiers = parse_modifiers(&calls[1..])?;
+
+    match method.as_str() {
         "find" => Ok(MongoOp::Find {
             collection,
             filter: if args.is_empty() {
@@ -169,6 +182,7 @@ fn parse_db_command(stmt: &str) -> Result<MongoOp, String> {
             } else {
                 Some(args.to_string())
             },
+            modifiers,
         }),
         "countDocuments" | "count" => Ok(MongoOp::CountDocuments {
             collection,
@@ -212,10 +226,125 @@ fn parse_db_command(stmt: &str) -> Result<MongoOp, String> {
             Ok(MongoOp::Aggregate {
                 collection,
                 pipeline: args.to_string(),
+                modifiers,
             })
         }
         _ => Err(format!("Unsupported method: {method}")),
     }
+}
+
+/// Parse a chain of method calls like `find({}).limit(100).sort({a:1})`
+/// Returns a Vec of (method_name, args_string) tuples.
+fn parse_chained_calls(input: &str) -> Result<Vec<(String, String)>, String> {
+    let mut calls = Vec::new();
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut pos = 0;
+
+    loop {
+        // Skip leading dot (for second+ calls)
+        if pos > 0 {
+            if pos >= len || chars[pos] != '.' {
+                break;
+            }
+            pos += 1; // skip '.'
+        }
+
+        // Read method name
+        let name_start = pos;
+        while pos < len && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
+            pos += 1;
+        }
+        if pos == name_start {
+            break;
+        }
+        let method_name: String = chars[name_start..pos].iter().collect();
+
+        // Expect '('
+        if pos >= len || chars[pos] != '(' {
+            return Err(format!("Expected '(' after method '{method_name}'"));
+        }
+        pos += 1; // skip '('
+
+        // Find matching ')' respecting nesting and strings
+        let args_start = pos;
+        let mut depth: i32 = 1;
+        let mut in_string = false;
+        let mut string_char = '"';
+
+        while pos < len && depth > 0 {
+            let ch = chars[pos];
+            if in_string {
+                if ch == '\\' && pos + 1 < len {
+                    pos += 1; // skip escaped char
+                } else if ch == string_char {
+                    in_string = false;
+                }
+            } else {
+                match ch {
+                    '"' | '\'' => {
+                        in_string = true;
+                        string_char = ch;
+                    }
+                    '(' | '{' | '[' => depth += 1,
+                    ')' | '}' | ']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth > 0 {
+                pos += 1;
+            }
+        }
+
+        if depth != 0 {
+            return Err(format!("Unmatched parenthesis in '{method_name}(...)' call"));
+        }
+
+        let args: String = chars[args_start..pos].iter().collect();
+        pos += 1; // skip closing ')'
+
+        calls.push((method_name, args));
+    }
+
+    Ok(calls)
+}
+
+/// Parse modifier calls (limit, skip, sort, projection) from chained calls.
+fn parse_modifiers(calls: &[(String, String)]) -> Result<QueryModifiers, String> {
+    let mut mods = QueryModifiers::default();
+    for (method, args) in calls {
+        let args = args.trim();
+        match method.as_str() {
+            "limit" => {
+                mods.limit = Some(
+                    args.parse::<i64>()
+                        .map_err(|_| format!("Invalid limit value: '{args}'"))?,
+                );
+            }
+            "skip" => {
+                mods.skip = Some(
+                    args.parse::<u64>()
+                        .map_err(|_| format!("Invalid skip value: '{args}'"))?,
+                );
+            }
+            "sort" => {
+                if args.is_empty() {
+                    return Err("sort() requires a document argument".into());
+                }
+                mods.sort = Some(args.to_string());
+            }
+            "projection" | "project" => {
+                if args.is_empty() {
+                    return Err("projection() requires a document argument".into());
+                }
+                mods.projection = Some(args.to_string());
+            }
+            other => {
+                return Err(format!("Unsupported chained method: .{other}()"));
+            }
+        }
+    }
+    Ok(mods)
 }
 
 // ─── Relaxed JSON → BSON helpers ─────────────────────────────────────────────
@@ -401,7 +530,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                     }
                 }
             }
-            MongoOp::Find { collection, filter } => {
+            MongoOp::Find { collection, filter, modifiers } => {
                 if conn.current_db.is_empty() {
                     QueryResult {
                         output: "Error: no database selected. Use `use <db>` first.".into(),
@@ -425,12 +554,46 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                         },
                         None => Document::new(),
                     };
-                    match coll.find(filter_doc).await {
+                    // Build find with chained modifiers
+                    let mut find = coll.find(filter_doc);
+                    let effective_limit = modifiers.limit.unwrap_or(100);
+                    find = find.limit(effective_limit);
+                    if let Some(skip) = modifiers.skip {
+                        find = find.skip(skip);
+                    }
+                    if let Some(ref sort_str) = modifiers.sort {
+                        match relaxed_json_to_doc(sort_str) {
+                            Ok(sort_doc) => { find = find.sort(sort_doc); }
+                            Err(e) => {
+                                results.push(QueryResult {
+                                    output: format!("Error parsing sort: {e}"),
+                                    elapsed: start.elapsed(),
+                                    _is_error: true,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(ref proj_str) = modifiers.projection {
+                        match relaxed_json_to_doc(proj_str) {
+                            Ok(proj_doc) => { find = find.projection(proj_doc); }
+                            Err(e) => {
+                                results.push(QueryResult {
+                                    output: format!("Error parsing projection: {e}"),
+                                    elapsed: start.elapsed(),
+                                    _is_error: true,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    match find.await {
                         Ok(mut cursor) => {
+                            let max = effective_limit.unsigned_abs() as usize;
                             let mut docs = Vec::new();
                             while let Ok(Some(doc)) = cursor.try_next().await {
                                 docs.push(doc);
-                                if docs.len() >= 100 {
+                                if docs.len() >= max {
                                     break;
                                 }
                             }
@@ -583,6 +746,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
             MongoOp::Aggregate {
                 collection,
                 pipeline,
+                modifiers,
             } => {
                 if conn.current_db.is_empty() {
                     QueryResult {
@@ -599,6 +763,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                             let quoted = add_quotes_to_keys(pipeline_str);
                             serde_json::from_str(&quoted)
                         });
+                    let max_docs = modifiers.limit.map(|l| l.unsigned_abs() as usize).unwrap_or(100);
                     match pipeline_val {
                         Ok(val) => match json_value_to_bson_array(&val) {
                             Ok(stages) => match coll.aggregate(stages).await {
@@ -606,7 +771,7 @@ async fn execute_ops(conn: &mut MongoConnection, ops: Vec<MongoOp>) -> Vec<Query
                                     let mut docs = Vec::new();
                                     while let Ok(Some(doc)) = cursor.try_next().await {
                                         docs.push(doc);
-                                        if docs.len() >= 100 {
+                                        if docs.len() >= max_docs {
                                             break;
                                         }
                                     }
@@ -700,6 +865,11 @@ const MONGO_METHODS: &[&str] = &[
     "aggregate",
     "updateOne",
     "updateMany",
+    "limit",
+    "skip",
+    "sort",
+    "projection",
+    "project",
 ];
 
 /// Syntax-highlight a mongo shell script for the editor.
